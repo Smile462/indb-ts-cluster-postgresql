@@ -1,4 +1,4 @@
-# In-database time-series clustering on PostgreSQL
+﻿# In-database time-series clustering on PostgreSQL
 
 Server-side implementation of the K-Shape / Medoid-Shape pipeline on PostgreSQL
 18, ported from the IoTDB reference implementation and from the sibling
@@ -138,3 +138,22 @@ The vendored kernel is a verbatim copy of
 `indb-ts-cluster-rocksdb:indb/core` at commit
 `c436790e21079bfb4eda2f7cb232ba9f6fe86a94`. See `vendor/README.md` for the
 per-file hashes.
+
+## Working with a clone
+
+This repository has been edited from more than one tool at a time. That once
+left a clone whose `main` pointed at an older commit while its working tree
+already held the newer changes, which is easy to misread as lost work. Every
+change should therefore follow the same sequence:
+
+1. `git fetch origin --prune` and look at `git status` before starting;
+2. commit your work;
+3. push, then immediately bring the local branch up to date
+   (`git checkout main && git merge --ff-only origin/main`), so a clone is never
+   left behind the remote;
+4. delete any temporary branch you created; a branch that was pushed to `main`
+   under another name is easily mistaken for unmerged work.
+
+The working clones are configured with `pull.ff = only`, `fetch.prune = true`
+and `push.default = simple`, so a pull can never create a merge commit by
+accident and a push cannot land on the wrong branch.
