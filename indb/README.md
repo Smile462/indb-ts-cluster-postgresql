@@ -107,6 +107,21 @@ sampling stream differs between the two adapters, so those centres agree
 statistically but not bit for bit. This matches the reference implementation,
 which also uses unseeded sampling.
 
+## Verification
+
+The full procedure lives in the RocksDB repository:
+`indb-ts-cluster-rocksdb:indb/docs/verification-plan.md`. It has seven stages,
+and two of the scripts exercise this extension directly:
+
+| Script (RocksDB repository) | What it checks here |
+|---|---|
+| `indb/scripts/verify.ps1` | creates the schema, imports the same series, builds metadata, and compares four paths against RocksDB |
+| `indb/scripts/verify-realdata.ps1` | the same on the real Air series, including page and chunk counts and cross platform parity |
+
+Both drop and recreate their own database, so they are safe to rerun.
+`indb_tsc_last_stats()` is backend local, so it must be read in the same
+session as the query it describes.
+
 ## Current limitations
 
 - Import is a row-oriented loop; it is fine for setup but not tuned for very
