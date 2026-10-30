@@ -258,6 +258,7 @@ PageMeta correct_page(const PageMeta& meta, const Points& raw, int64_t t0, int64
   corrected.n_seq = static_cast<int32_t>(
       std::max<int64_t>(0, static_cast<int64_t>(meta.n_seq) - static_cast<int64_t>(removed.size())));
   corrected.idx.assign(static_cast<size_t>(corrected.n_seq), -1);
+  corrected.ed_idx.assign(static_cast<size_t>(corrected.n_seq), -1);
 
   // Rebuild centroids from the corrected matrices so the stored centroid and
   // its matrix stay consistent.

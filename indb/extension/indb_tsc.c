@@ -63,6 +63,17 @@ static Datum ByteaDatum(const char *buffer, size_t length)
     return PointerGetDatum(value);
 }
 
+/* centers is allocated with SPI_palloc in the caller context, so it remains
+ * valid after SPI_finish frees the SPI procedure context. */
+static ArrayType *FinishQueryResult(double *centers, int n)
+{
+    ArrayType *result;
+    SPI_finish();
+    result = DoublesToArray(centers, n);
+    pfree(centers);
+    return result;
+}
+
 /* Loads the parameters recorded for a dataset. Returns false if absent. */
 static bool LoadParams(int ds, indb_params *params, bool *found)
 {
@@ -639,7 +650,7 @@ static ArrayType *RunQuery(int32 ds, int64 t0, int64 t1, const char *level, bool
                         errmsg("dataset %d has no metadata; run indb_tsc_build first", ds)));
 
     const int capacity = params.k * params.l;
-    double *centers = (double *) palloc(sizeof(double) * (size_t) capacity);
+    double *centers = (double *) SPI_palloc(sizeof(double) * (size_t) capacity);
     int produced = 0;
     char err[1024] = {0};
     memset(&g_last_stats, 0, sizeof(g_last_stats));
@@ -747,8 +758,7 @@ static ArrayType *RunQuery(int32 ds, int64 t0, int64 t1, const char *level, bool
         g_last_stats.units_merged = unit_count;
         if (unit_count == 0) {
             /* No overlap: return an empty array. */
-            SPI_finish();
-            return DoublesToArray(centers, 0);
+            return FinishQueryResult(centers, 0);
         }
 
         if (medoid) {
@@ -757,8 +767,7 @@ static ArrayType *RunQuery(int32 ds, int64 t0, int64 t1, const char *level, bool
             int candidate_count = SampleCandidates(ds, &params, pages, page_count, max_sequences,
                                                    &candidates);
             if (candidate_count <= 0) {
-                SPI_finish();
-                return DoublesToArray(centers, 0);
+                return FinishQueryResult(centers, 0);
             }
             if (indb_merge_medoid(unit_metas, unit_lens, unit_count, candidates, candidate_count,
                                   &params, centers, capacity, &produced, err, sizeof(err)) != 0)
@@ -771,8 +780,7 @@ static ArrayType *RunQuery(int32 ds, int64 t0, int64 t1, const char *level, bool
         }
     }
 
-    SPI_finish();
-    return DoublesToArray(centers, produced);
+    return FinishQueryResult(centers, produced);
 }
 
 PG_FUNCTION_INFO_V1(indb_tsc_kshape);
