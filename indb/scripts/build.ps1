@@ -59,7 +59,7 @@ $commands += $linkLine
 
 $script = ($commands -join "`r`n")
 $batch = Join-Path $OutDir 'build.bat'
-Set-Content -Path $batch -Value ("@echo off`r`ncall `"$vcvars`" >nul 2>&1`r`n" + $script + "`r`n") -Encoding ASCII
+Set-Content -Path $batch -Value ("@echo off`r`nchcp 65001 >nul`r`ncall `"$vcvars`" >nul 2>&1`r`n" + $script + "`r`n") -Encoding utf8NoBOM
 
 Write-Host "Building in $OutDir"
 & cmd /c "`"$batch`""

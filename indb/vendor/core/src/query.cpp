@@ -131,6 +131,7 @@ QueryResult kshape_centers(const std::vector<PageMeta>& units, const Config& con
   QueryResult result;
   if (units.empty()) return result;
   const PageMeta merged = build_chunk_meta(units, config);
+  result.stats.represented_subsequences=merged.n_seq;
   result.centers.resize(static_cast<size_t>(config.k));
   for (int c = 0; c < config.k; ++c) {
     Mat sum(config.l, config.l);
@@ -149,6 +150,7 @@ QueryResult medoid_centers(const std::vector<PageMeta>& units, const std::vector
   QueryResult result;
   if (units.empty() || candidates.empty()) return result;
   const PageMeta merged = build_chunk_meta(units, config);
+  result.stats.represented_subsequences=merged.n_seq;
 
   std::vector<Vec> normalized;
   normalized.reserve(candidates.size());
@@ -214,7 +216,7 @@ QueryResult mshape_raw(const Points& points, const Config& config) {
   return result;
 }
 
-PageMeta correct_page(const PageMeta& meta, const Points& raw, int64_t t0, int64_t t1,
+static PageMeta page_correct_page(const PageMeta& meta, const Points& raw, int64_t t0, int64_t t1,
                       const Config& config, QueryStats* stats) {
   const int l = config.l;
   if (raw.ts.empty()) return meta;
@@ -291,6 +293,14 @@ PageMeta correct_page(const PageMeta& meta, const Points& raw, int64_t t0, int64
   corrected.t_end = floor_div(new_end, l) * l;
   corrected.count = new_end - new_start + 1;
   return corrected;
+}
+
+PageMeta correct_page(const PageMeta& meta,const Points& raw,int64_t t0,int64_t t1,const Config& config,QueryStats* stats) {
+  if(!config.chunk_path)return page_correct_page(meta,raw,t0,t1,config,stats);
+  Points restricted;
+  if(stats)stats->raw_points_read+=raw.size();
+  for(size_t i=0;i<raw.size();i++)if(raw.ts[i]>=t0 && raw.ts[i]<=t1){restricted.ts.push_back(raw.ts[i]);restricted.values.push_back(raw.values[i]);}
+  return build_page_meta(restricted,config,config.seed ^ static_cast<uint64_t>(meta.t_start));
 }
 
 namespace {

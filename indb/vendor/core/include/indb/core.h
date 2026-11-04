@@ -52,6 +52,7 @@ using Vec = std::vector<double>;
 // ---------------------------------------------------------------------------
 
 struct Config {
+  bool chunk_path = false;
   int k = 3;                 // number of clusters
   int l = 166;               // subsequence length
   int edk = 0;               // approximate clusters for Medoid-Shape, 0 => k + 2
@@ -66,6 +67,8 @@ struct Config {
 
   int edk_effective() const { return edk > 0 ? edk : k + 2; }
 };
+
+inline Config chunk_config(Config config) { config.chunk_path=true; return config; }
 
 // ---------------------------------------------------------------------------
 // Deterministic randomness
@@ -159,6 +162,7 @@ constexpr int32_t kMetaVersion = 1;
 enum class Level { Page, Chunk };
 
 struct PageMeta {
+  bool grid_fragments = false;
   int32_t version = kMetaVersion;
   int32_t k = 0;
   int32_t l = 0;
@@ -228,6 +232,9 @@ using RawPageLoader = std::function<bool(int64_t page_no, Points* out)>;
 using SampledSource = std::function<bool(int max_sequences, std::vector<Vec>* out)>;
 
 struct QueryStats {
+  int64_t represented_subsequences = 0;
+  int64_t candidate_count = 0;
+  uint64_t candidate_hash = 0xcbf29ce484222325ULL;
   int64_t pages_considered = 0;
   int64_t pages_meta_used = 0;
   int64_t pages_corrected = 0;
@@ -235,7 +242,7 @@ struct QueryStats {
   int64_t chunks_descended = 0;
   int64_t units_merged = 0;
   int64_t raw_points_read = 0;
-  int64_t meta_bytes_read = 0;
+  int64_t metadata_payload_bytes = 0;
 };
 
 struct QueryResult {

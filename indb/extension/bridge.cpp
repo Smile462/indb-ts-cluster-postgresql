@@ -1,3 +1,5 @@
+#include "indb/journal_profile.h"
+#include <memory>
 //  Copyright (c) 2026 The in-database time-series clustering authors.
 //  This source code is licensed under both the GPLv2 (found in the
 //  COPYING file in the root directory) and Apache 2.0 License
@@ -20,6 +22,7 @@ namespace {
 
 indb::Config ToConfig(const indb_params* params) {
   indb::Config config;
+  config.chunk_path=params->chunk_path!=0;
   config.k = params->k;
   config.l = params->l;
   config.edk = params->edk;
@@ -79,7 +82,13 @@ int CopyCenters(const indb::QueryResult& result, double* out, int out_cap, int* 
 
 }  // namespace
 
+static thread_local long long journal_merged_count=0;
+static thread_local std::unique_ptr<JournalQueryMemory> journal_memory;
+static thread_local std::string journal_memory_json;
 extern "C" {
+void indb_query_memory_start(int enabled){journal_memory.reset(new JournalQueryMemory(enabled!=0));}
+const char* indb_query_memory_stop(void){journal_memory_json=journal_memory?journal_memory->Json():"null";return journal_memory_json.c_str();}
+long long indb_last_merged_count(void){return journal_merged_count;}
 
 int indb_build_page_meta(const long long* ts, const double* values, int n,
                          const indb_params* params, unsigned long long page_seed,
@@ -101,7 +110,7 @@ int indb_build_chunk_meta(const char* const* metas, const size_t* lens, int n,
                           const indb_params* params, char** out_buf, size_t* out_len, char* err,
                           size_t err_len) {
   try {
-    const indb::Config config = ToConfig(params);
+    const indb::Config config = indb::chunk_config(ToConfig(params));
     const indb::PageMeta chunk = indb::build_chunk_meta(ToMetas(metas, lens, n), config);
     return CopyMeta(chunk, out_buf, out_len);
   } catch (const std::exception& error) {
@@ -141,6 +150,7 @@ int indb_merge(const char* const* metas, const size_t* lens, int n, const indb_p
   try {
     const indb::Config config = ToConfig(params);
     const indb::QueryResult result = indb::kshape_centers(ToMetas(metas, lens, n), config);
+    journal_merged_count=result.stats.represented_subsequences;
     return CopyCenters(result, out, out_cap, out_n);
   } catch (const std::exception& error) {
     WriteError(err, err_len, error.what());
@@ -164,6 +174,7 @@ int indb_merge_medoid(const char* const* metas, const size_t* lens, int n,
     }
     const indb::QueryResult result =
         indb::medoid_centers(ToMetas(metas, lens, n), sequences, config);
+    journal_merged_count=result.stats.represented_subsequences;
     return CopyCenters(result, out, out_cap, out_n);
   } catch (const std::exception& error) {
     WriteError(err, err_len, error.what());
@@ -182,6 +193,7 @@ int indb_raw(int medoid, const long long* ts, const double* values, int n,
     const indb::Points points = ToPoints(ts, values, n);
     const indb::QueryResult result =
         medoid ? indb::mshape_raw(points, config) : indb::kshape_raw(points, config);
+    journal_merged_count=result.stats.represented_subsequences;
     return CopyCenters(result, out, out_cap, out_n);
   } catch (const std::exception& error) {
     WriteError(err, err_len, error.what());

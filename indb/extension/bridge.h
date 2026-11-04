@@ -22,6 +22,7 @@ extern "C" {
 #endif
 
 typedef struct indb_params {
+  int chunk_path;
   int k;
   int l;
   int edk; /* 0 means k + 2 */
@@ -85,6 +86,9 @@ int indb_grid_subsequences(const long long *ts, const double *values, int n,
                            int l, double *out, int out_cap, int *out_n,
                            char *err, size_t err_len);
 
+void indb_query_memory_start(int enabled);
+const char* indb_query_memory_stop(void);
+long long indb_last_merged_count(void);
 void indb_free(void *pointer);
 
 #ifdef __cplusplus

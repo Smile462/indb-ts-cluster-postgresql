@@ -115,7 +115,7 @@ class Reader {
 
 }  // namespace
 
-PageMeta build_page_meta(const Points& points, const Config& config, uint64_t seed) {
+static PageMeta page_build_meta(const Points& points, const Config& config, uint64_t seed) {
   if (points.ts.size() != points.values.size()) throw AlgorithmError("inconsistent page points");
   const int l = config.l;
   if (l < 2) throw AlgorithmError("seq length must be at least 2");
@@ -193,7 +193,7 @@ PageMeta build_page_meta(const Points& points, const Config& config, uint64_t se
   return meta;
 }
 
-PageMeta build_chunk_meta(const std::vector<PageMeta>& pages, const Config& config) {
+static PageMeta page_merge_meta(const std::vector<PageMeta>& pages, const Config& config) {
   if (pages.empty()) throw AlgorithmError("cannot merge an empty page list");
   const int l = config.l;
   const int k = config.k;
@@ -299,6 +299,207 @@ PageMeta build_chunk_meta(const std::vector<PageMeta>& pages, const Config& conf
   return chunk;
 }
 
+PageMeta build_page_meta(const Points& points, const Config& config, uint64_t seed) {
+  if(!config.chunk_path)return page_build_meta(points,config,seed);
+  if (points.ts.size() != points.values.size()) throw AlgorithmError("inconsistent page points");
+  const int l = config.l;
+  if (l < 2) throw AlgorithmError("seq length must be at least 2");
+
+  PageMeta meta;
+  meta.grid_fragments=true;
+  meta.version = kMetaVersion;
+  meta.k = config.k;
+  meta.l = l;
+  meta.edk = config.edk_effective();
+  meta.sum_matrices.assign(static_cast<size_t>(config.k) * l * l, 0.0);
+  meta.centroids.assign(static_cast<size_t>(config.k) * l, 0.0);
+  meta.deltas.assign(static_cast<size_t>(config.k), 0.0);
+  meta.ed_centroids.assign(static_cast<size_t>(meta.edk) * l, 0.0);
+  meta.ed_deltas.assign(static_cast<size_t>(meta.edk), 0.0);
+  meta.ed_counts.assign(static_cast<size_t>(meta.edk), 0);
+  meta.head_extra.assign(static_cast<size_t>(l), 0.0);
+  meta.tail_extra.assign(static_cast<size_t>(l), 0.0);
+
+  if (points.ts.empty()) return meta;
+  meta.t_start = points.ts.front();
+  meta.t_end = points.ts.back();
+  meta.count = static_cast<int64_t>(points.ts.size());
+  if (static_cast<int>(points.ts.size()) < l) return meta;
+
+  const int64_t seq_start = ceil_div(meta.t_start, l) * l;
+  std::vector<Vec> sequences;
+  Vec current;
+  for (size_t i = 0; i < points.ts.size(); ++i) {
+    if (points.ts[i] < seq_start) {
+      if (static_cast<int>(i) < l) meta.head_extra[static_cast<size_t>(points.ts[i] % l)] = points.values[i];
+      continue;
+    }
+    current.push_back(points.values[i]);
+    if (static_cast<int>(current.size()) == l) {
+      sequences.push_back(current);
+      current.clear();
+    }
+  }
+  if (!current.empty()) {
+    const size_t begin = static_cast<size_t>(l) - current.size();
+    for (size_t i = 0; i < current.size(); ++i) meta.tail_extra[i] = current[i];
+  }
+
+  meta.n_seq = static_cast<int32_t>(sequences.size());
+  // A short or badly aligned page can yield no complete subsequence. The
+  // reference throws here; this implementation keeps an empty record.
+  if (sequences.empty()) return meta;
+
+  std::vector<Vec> normalized;
+  normalized.reserve(sequences.size());
+  for (const Vec& seq : sequences) normalized.push_back(zscore(seq));
+
+  Rng rng(seed);
+  // The reference runs K-Shape first and then K-Means over the same
+  // subsequences, both with the build iteration count.
+  const KShapeResult kshape = kshape_fit(normalized, config.k, config.iter_build, rng);
+  for (int c = 0; c < config.k; ++c) {
+    for (int r = 0; r < l; ++r) {
+      for (int q = 0; q < l; ++q) meta.set_sum_matrix(c, r, q, kshape.sum_matrices[static_cast<size_t>(c)].at(r, q));
+    }
+    for (int r = 0; r < l; ++r) meta.set_centroid(c, r, kshape.centroids.at(c, r));
+    meta.deltas[static_cast<size_t>(c)] = kshape.deltas[static_cast<size_t>(c)];
+  }
+  meta.idx.assign(kshape.idx.begin(), kshape.idx.end());
+
+  const KMeansResult approx = kmeans(meta.edk, config.iter_build, normalized, rng);
+  for (int c = 0; c < meta.edk; ++c) {
+    for (int r = 0; r < l; ++r) meta.set_ed_centroid(c, r, approx.centroids.at(c, r));
+    meta.ed_deltas[static_cast<size_t>(c)] = approx.deltas[static_cast<size_t>(c)];
+  }
+  meta.ed_idx.assign(approx.idx.begin(), approx.idx.end());
+  for (int32_t label : meta.ed_idx) {
+    if (label >= 0 && label < meta.edk) ++meta.ed_counts[static_cast<size_t>(label)];
+  }
+  return meta;
+}
+
+PageMeta build_chunk_meta(const std::vector<PageMeta>& input_pages, const Config& config) {
+  if(!config.chunk_path)return page_merge_meta(input_pages,config);
+  std::vector<PageMeta> pages=input_pages;
+  for(auto& page:pages)if(!page.grid_fragments && !page.is_chunk) {
+    auto head=page.head_extra,tail=page.tail_extra;
+    std::fill(page.head_extra.begin(),page.head_extra.end(),0.0);
+    std::fill(page.tail_extra.begin(),page.tail_extra.end(),0.0);
+    const int offset=static_cast<int>(page.t_start%config.l);
+    const int h=offset==0?0:static_cast<int>(std::min<int64_t>(page.count,config.l-offset));
+    for(int i=0;i<h;i++)page.head_extra[offset+i]=head[i];
+    const int n=static_cast<int>((page.t_end+1)%config.l);
+    if(page.t_end/config.l>=(page.t_start+config.l-1)/config.l)
+      for(int i=0;i<n;i++)page.tail_extra[i]=tail[config.l-n+i];
+    page.grid_fragments=true;
+  }
+
+  if (pages.empty()) throw AlgorithmError("cannot merge an empty page list");
+  const int l = config.l;
+  const int k = config.k;
+  const int edk = config.edk_effective();
+
+  PageMeta chunk = pages.front();
+  chunk.is_chunk = true;
+  chunk.grid_fragments=true;
+
+  std::vector<double> ed_centroids = pages.front().ed_centroids;
+  std::vector<int32_t> ed_counts = pages.front().ed_counts;
+
+  std::vector<int> counts(static_cast<size_t>(k), 0);
+  for (int c = 0; c < k; ++c) counts[static_cast<size_t>(c)] = count_members(chunk.idx, c);
+
+  for (size_t i = 1; i < pages.size(); ++i) {
+    const PageMeta& page = pages[i];
+
+    for (int j = 0; j < page.k; ++j) {
+      const int nearest = nearest_by_sbd(page.centroids.data() + static_cast<size_t>(j) * l, chunk);
+      if (nearest < 0) continue;
+      for (int r = 0; r < l; ++r) {
+        for (int q = 0; q < l; ++q) {
+          chunk.set_sum_matrix(nearest, r, q, chunk.sum_matrix(nearest, r, q) + page.sum_matrix(j, r, q));
+        }
+      }
+      const int page_count = count_members(page.idx, j);
+      const int total = counts[static_cast<size_t>(nearest)] + page_count;
+      for (int r = 0; r < l; ++r) {
+        const double weighted = chunk.centroid(nearest, r) * counts[static_cast<size_t>(nearest)] +
+                                page.centroid(j, r) * page_count;
+        chunk.set_centroid(nearest, r, total == 0 ? 0.0 : weighted / total);
+      }
+      counts[static_cast<size_t>(nearest)] += page_count;
+    }
+
+    for (int j = 0; j < page.edk; ++j) {
+      if (page.ed_counts[static_cast<size_t>(j)] == 0) continue;
+      const int nearest = nearest_by_l2(page.ed_centroids.data() + static_cast<size_t>(j) * l,
+                                        ed_centroids, edk, l);
+      if (nearest < 0) continue;
+      const int total = ed_counts[static_cast<size_t>(nearest)] + page.ed_counts[static_cast<size_t>(j)];
+      for (int r = 0; r < l; ++r) {
+        const double weighted = ed_centroids[static_cast<size_t>(nearest) * l + r] *
+                                    ed_counts[static_cast<size_t>(nearest)] +
+                                page.ed_centroids[static_cast<size_t>(j) * l + r] *
+                                    page.ed_counts[static_cast<size_t>(j)];
+        ed_centroids[static_cast<size_t>(nearest) * l + r] = total == 0 ? 0.0 : weighted / total;
+      }
+      ed_counts[static_cast<size_t>(nearest)] += page.ed_counts[static_cast<size_t>(j)];
+    }
+
+    const bool has_head = page.t_start % l != 0 && pages[i-1].t_end+1==page.t_start && pages[i-1].t_start<=page.t_start/l*l && page.t_end>=(page.t_start/l+1)*l-1;
+    if (has_head) {
+      // head + tail reconstructs the subsequence that straddles the boundary.
+      Vec merged(static_cast<size_t>(l));
+      for (int r = 0; r < l; ++r) {
+        merged[static_cast<size_t>(r)] =
+            page.head_extra[static_cast<size_t>(r)] + pages[i - 1].tail_extra[static_cast<size_t>(r)];
+      }
+      merged = zscore(merged);
+
+      const int nearest = nearest_by_sbd(merged.data(), chunk);
+      if (nearest >= 0) {
+        for (int r = 0; r < l; ++r) {
+          for (int q = 0; q < l; ++q) {
+            chunk.set_sum_matrix(nearest, r, q,
+                                 chunk.sum_matrix(nearest, r, q) +
+                                     merged[static_cast<size_t>(r)] * merged[static_cast<size_t>(q)]);
+          }
+        }
+        ++counts[static_cast<size_t>(nearest)];
+      }
+
+      const int nearest_ed = nearest_by_l2(merged.data(), ed_centroids, edk, l);
+      if (nearest_ed >= 0) {
+        const int total = ed_counts[static_cast<size_t>(nearest_ed)] + 1;
+        for (int r = 0; r < l; ++r) {
+          const double weighted =
+              ed_centroids[static_cast<size_t>(nearest_ed) * l + r] *
+                  ed_counts[static_cast<size_t>(nearest_ed)] +
+              merged[static_cast<size_t>(r)];
+          ed_centroids[static_cast<size_t>(nearest_ed) * l + r] = weighted / total;
+        }
+        ++ed_counts[static_cast<size_t>(nearest_ed)];
+      }
+    }
+  }
+
+  chunk.ed_centroids = std::move(ed_centroids);
+  chunk.ed_counts = std::move(ed_counts);
+  chunk.head_extra = pages.front().head_extra;
+  chunk.tail_extra = pages.back().tail_extra;
+  chunk.t_start = pages.front().t_start;
+  chunk.t_end = pages.back().t_end;
+  chunk.idx.clear();chunk.ed_idx.clear();
+  for(int c=0;c<k;c++)chunk.idx.insert(chunk.idx.end(),counts[c],c);
+  for(int c=0;c<edk;c++)chunk.ed_idx.insert(chunk.ed_idx.end(),chunk.ed_counts[c],c);
+  chunk.n_seq=static_cast<int32_t>(chunk.idx.size());
+  if(chunk.ed_idx.size()!=chunk.idx.size())throw AlgorithmError("K/M merged identity counts disagree");
+  chunk.count = 0;
+  for (const PageMeta& page : pages) chunk.count += page.count;
+  return chunk;
+}
+
 std::string encode_meta(const PageMeta& meta) {
   std::string out;
   out.reserve(256 + meta.sum_matrices.size() * sizeof(double) + meta.centroids.size() * sizeof(double));
@@ -311,7 +512,7 @@ std::string encode_meta(const PageMeta& meta) {
   put_i64(&out, meta.t_start);
   put_i64(&out, meta.t_end);
   put_i64(&out, meta.count);
-  put_u8(&out, meta.is_chunk ? 1 : 0);
+  put_u8(&out, (meta.is_chunk ? 1 : 0) | (meta.grid_fragments ? 2 : 0));
   put_doubles(&out, meta.sum_matrices);
   put_doubles(&out, meta.centroids);
   put_doubles(&out, meta.deltas);
@@ -338,7 +539,9 @@ PageMeta decode_meta(const std::string& bytes) {
   meta.t_start = reader.i64();
   meta.t_end = reader.i64();
   meta.count = reader.i64();
-  meta.is_chunk = reader.u8() != 0;
+  const uint8_t journal_flags=reader.u8();
+  meta.is_chunk=(journal_flags & 1)!=0;
+  meta.grid_fragments=(journal_flags & 2)!=0 || meta.is_chunk;
 
   if (meta.version != kMetaVersion) {
     throw AlgorithmError("unsupported metadata version " + std::to_string(meta.version));
