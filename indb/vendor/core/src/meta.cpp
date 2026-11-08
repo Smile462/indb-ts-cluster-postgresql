@@ -30,11 +30,16 @@ int count_members(const std::vector<int32_t>& idx, int label) {
   return count;
 }
 
-int nearest_by_sbd(const double* probe, const PageMeta& meta) {
+int nearest_by_sbd(const double* probe, const PageMeta& meta, bool guard_degenerate = false) {
   int best = -1;
   double best_distance = std::numeric_limits<double>::max();
   for (int c = 0; c < meta.k; ++c) {
-    const double d = sbd(probe, meta.centroids.data() + static_cast<size_t>(c) * meta.l, meta.l);
+    const double* center = meta.centroids.data() + static_cast<size_t>(c) * meta.l;
+    double d = sbd(probe, center, meta.l);
+    // A running weighted center may cancel to zero. The reference distance
+    // divides by its norm again and becomes non-finite. Keep Page arithmetic
+    // unchanged, but do not drop Chunk weights because of that degenerate norm.
+    if (guard_degenerate && !std::isfinite(d)) d = sbd_assignment(probe, center, meta.l);
     if (d < best_distance) {
       best_distance = d;
       best = c;
@@ -414,7 +419,7 @@ PageMeta build_chunk_meta(const std::vector<PageMeta>& input_pages, const Config
     const PageMeta& page = pages[i];
 
     for (int j = 0; j < page.k; ++j) {
-      const int nearest = nearest_by_sbd(page.centroids.data() + static_cast<size_t>(j) * l, chunk);
+      const int nearest = nearest_by_sbd(page.centroids.data() + static_cast<size_t>(j) * l, chunk, true);
       if (nearest < 0) continue;
       for (int r = 0; r < l; ++r) {
         for (int q = 0; q < l; ++q) {
@@ -457,7 +462,7 @@ PageMeta build_chunk_meta(const std::vector<PageMeta>& input_pages, const Config
       }
       merged = zscore(merged);
 
-      const int nearest = nearest_by_sbd(merged.data(), chunk);
+      const int nearest = nearest_by_sbd(merged.data(), chunk, true);
       if (nearest >= 0) {
         for (int r = 0; r < l; ++r) {
           for (int q = 0; q < l; ++q) {
@@ -493,8 +498,15 @@ PageMeta build_chunk_meta(const std::vector<PageMeta>& input_pages, const Config
   chunk.idx.clear();chunk.ed_idx.clear();
   for(int c=0;c<k;c++)chunk.idx.insert(chunk.idx.end(),counts[c],c);
   for(int c=0;c<edk;c++)chunk.ed_idx.insert(chunk.ed_idx.end(),chunk.ed_counts[c],c);
-  chunk.n_seq=static_cast<int32_t>(chunk.idx.size());
-  if(chunk.ed_idx.size()!=chunk.idx.size())throw AlgorithmError("K/M merged identity counts disagree");
+  if (config.medoid_page_correction) {
+    // Page correction invalidates K membership labels. This transient M-only
+    // aggregation takes its represented weight from M statistics instead.
+    chunk.n_seq = static_cast<int32_t>(chunk.ed_idx.size());
+    chunk.idx.assign(static_cast<size_t>(chunk.n_seq), -1);
+  } else {
+    chunk.n_seq=static_cast<int32_t>(chunk.idx.size());
+    if(chunk.ed_idx.size()!=chunk.idx.size())throw AlgorithmError("K/M merged identity counts disagree");
+  }
   chunk.count = 0;
   for (const PageMeta& page : pages) chunk.count += page.count;
   return chunk;

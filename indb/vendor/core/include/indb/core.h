@@ -53,6 +53,7 @@ using Vec = std::vector<double>;
 
 struct Config {
   bool chunk_path = false;
+  bool medoid_page_correction = false;
   int k = 3;                 // number of clusters
   int l = 166;               // subsequence length
   int edk = 0;               // approximate clusters for Medoid-Shape, 0 => k + 2

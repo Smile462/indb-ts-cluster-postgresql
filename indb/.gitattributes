@@ -1,0 +1,3 @@
+# The standalone add-on and its shared numerical core use space indentation.
+*.[ch] whitespace=space-before-tab,trailing-space
+*.cpp whitespace=space-before-tab,trailing-space

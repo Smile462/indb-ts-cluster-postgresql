@@ -124,10 +124,11 @@ int indb_build_chunk_meta(const char* const* metas, const size_t* lens, int n,
 
 int indb_correct_page(const char* meta, size_t meta_len, const long long* ts, const double* values,
                       int n, long long t0, long long t1, const indb_params* params,
-                      char** out_buf, size_t* out_len, indb_stats* stats, char* err,
+                      int medoid, char** out_buf, size_t* out_len, indb_stats* stats, char* err,
                       size_t err_len) {
   try {
-    const indb::Config config = ToConfig(params);
+    indb::Config config = ToConfig(params);
+    config.medoid_page_correction = medoid != 0;
     const indb::PageMeta original = indb::decode_meta(std::string(meta, meta_len));
     indb::QueryStats local;
     const indb::PageMeta corrected =

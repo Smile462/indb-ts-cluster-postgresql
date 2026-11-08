@@ -1,4 +1,4 @@
-﻿/*  Copyright (c) 2026 The in-database time-series clustering authors.
+/*  Copyright (c) 2026 The in-database time-series clustering authors.
  *  This source code is licensed under both the GPLv2 (found in the
  *  COPYING file in the root directory) and Apache 2.0 License
  *  (found in the LICENSE.Apache file in the root directory).
@@ -649,10 +649,19 @@ static void EnsurePageMeta(int ds, PageRow *page,const indb_params *params) {
         memcpy(page->meta,built,length);indb_free(built);pfree(ts);pfree(values);
     }
 }
-/* Collects the medoid candidate subsequences by sampling pages. */
+typedef struct CandidatePageCache {
+    bool loaded;
+    int sequences;
+    double *values;
+} CandidatePageCache;
+
+/* Shared by Page-M and Chunk-M. Keep weighted draws and repeated candidates,
+ * but read/extract each sampled page once per query. The first page that does
+ * not fit contributes its chronological prefix and fills the candidate pool. */
 static int SampleCandidates(int ds, const indb_params *params, const PageRow *pages, int page_count,
                             int max_sequences, double **out)
 {
+    *out = NULL;
     if (page_count <= 0 || max_sequences <= 0)
         return 0;
 
@@ -663,10 +672,17 @@ static int SampleCandidates(int ds, const indb_params *params, const PageRow *pa
         return 0;
 
     double *buffer = (double *) palloc(sizeof(double) * (size_t) max_sequences * params->l);
+    CandidatePageCache *cache = (CandidatePageCache *) palloc0(sizeof(CandidatePageCache) * (size_t) page_count);
     int collected = 0;
+    int attempts = 0, page_reads = 0, cache_hits = 0;
+    long long candidate_raw_points = 0;
+    size_t cached_bytes = 0;
+    bool partial_page = false;
     uint32 state = (uint32) (params->seed ^ 0x9E3779B9U);
 
     for (int attempt = 0; attempt < max_sequences * 8 && collected < max_sequences; attempt++) {
+        CHECK_FOR_INTERRUPTS();
+        attempts++;
         /* Deterministic xorshift so repeated runs agree. */
         state ^= state << 13;
         state ^= state >> 17;
@@ -688,27 +704,67 @@ static int SampleCandidates(int ds, const indb_params *params, const PageRow *pa
         if ((double) (state % 1000) / 1000.0 > params->r)
             continue;
 
-        long long *ts = NULL;
-        double *values = NULL;
-        int count = 0;
-        FetchRange(ds, pages[index].t_start, pages[index].t_end, &ts, &values, &count);
-        g_last_stats.raw_points+=count;
-        if (count >= params->l) {
-            const int capacity = max_sequences * params->l;
+        CandidatePageCache *entry = &cache[index];
+        if (!entry->loaded) {
+            long long *ts = NULL;
+            double *values = NULL;
+            int count = 0;
+            FetchRange(ds, pages[index].t_start, pages[index].t_end, &ts, &values, &count);
+            page_reads++;
+            candidate_raw_points += count;
+            g_last_stats.raw_points += count;
             int produced = 0;
             char err[512] = {0};
-            if (indb_grid_subsequences(ts, values, count, params->l,
-                                       buffer + (size_t) collected * params->l,
-                                       capacity - collected * params->l, &produced, err,
-                                       sizeof(err)) != 0)
-                produced = 0;
-            collected += produced / params->l;
+            double *sequences = NULL;
+            if (count >= params->l) {
+                /* Extraction emits at most count values. Use independent
+                 * space, so an oversized page is not an extraction error. */
+                sequences = (double *) palloc(sizeof(double) * (size_t) count);
+                if (indb_grid_subsequences(ts, values, count, params->l,
+                                           sequences, count, &produced, err, sizeof(err)) != 0)
+                    ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+                                    errmsg("Candidate extraction failed for page %lld: %s", pages[index].page_no, err)));
+                if (produced < 0 || produced > count || produced % params->l != 0)
+                    ereport(ERROR, (errmsg("Invalid candidate extraction length for page %lld", pages[index].page_no)));
+            }
+            entry->sequences = produced / params->l;
+            if (produced > 0) {
+                int retained = entry->sequences < max_sequences - collected ? entry->sequences : max_sequences - collected;
+                size_t bytes = sizeof(double) * (size_t) retained * params->l;
+                entry->values = (double *) repalloc(sequences, bytes);
+                cached_bytes += bytes;
+            } else if (sequences != NULL) {
+                pfree(sequences);
+            }
+            entry->loaded = true; /* Also cache pages with no complete sequences. */
+            pfree(ts);
+            pfree(values);
+        } else {
+            cache_hits++;
         }
-        pfree(ts);
-        pfree(values);
-        CHECK_FOR_INTERRUPTS();
+        const int remaining = max_sequences - collected;
+        const int take = entry->sequences < remaining ? entry->sequences : remaining;
+        if (take > 0) {
+            memcpy(buffer + (size_t) collected * params->l, entry->values,
+                   sizeof(double) * (size_t) take * params->l);
+            collected += take;
+            if (take < entry->sequences) partial_page = true;
+        }
+        /* collected == max_sequences terminates the loop, including when
+         * the final page contributed only its remaining-capacity prefix. */
     }
 
+    /* Fingerprint candidate values in their actual order, including repeats.
+     * This is a content fingerprint, not a subsequence-ID fingerprint. */
+    const unsigned char *bytes = (const unsigned char *) buffer;
+    for (size_t i = 0; i < sizeof(double) * (size_t) collected * params->l; i++)
+        journal_candidate_hash = (journal_candidate_hash ^ bytes[i]) * 0x100000001b3ULL;
+    for (int i = 0; i < page_count; i++)
+        if (cache[i].values != NULL) pfree(cache[i].values);
+    pfree(cache);
+    ereport(NOTICE, (errmsg("JOURNAL_SAMPLER:{\"policy\":\"whole_pages_then_prefix_fill_with_query_cache\",\"attempts\":%d,\"page_reads\":%d,\"cache_hits\":%d,\"raw_points\":%lld,\"cached_sequence_bytes\":%llu,\"candidate_count\":%d,\"partial_final_page\":%s,\"candidate_content_hash\":\"%016llx\"}",
+                            attempts, page_reads, cache_hits, candidate_raw_points,
+                            (unsigned long long) cached_bytes, collected, partial_page ? "true" : "false", journal_candidate_hash)));
     *out = buffer;
     return collected;
 }
@@ -805,7 +861,7 @@ static ArrayType *RunQuery(int32 ds, int64 t0, int64 t1, const char *level, bool
                         char *corrected = NULL;
                         size_t corrected_len = 0;
                         if (indb_correct_page(pages[p].meta, pages[p].meta_len, ts, values, count,
-                                              t0, t1, &params, &corrected, &corrected_len,
+                                              t0, t1, &params, medoid ? 1 : 0, &corrected, &corrected_len,
                                               &g_last_stats, err, sizeof(err)) != 0)
                             ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
                                             errmsg("%s", err)));
@@ -837,7 +893,7 @@ static ArrayType *RunQuery(int32 ds, int64 t0, int64 t1, const char *level, bool
                     char *corrected = NULL;
                     size_t corrected_len = 0;
                     if (indb_correct_page(pages[p].meta, pages[p].meta_len, ts, values, count, t0,
-                                          t1, &params, &corrected, &corrected_len, &g_last_stats,
+                                          t1, &params, medoid ? 1 : 0, &corrected, &corrected_len, &g_last_stats,
                                           err, sizeof(err)) != 0)
                         ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR), errmsg("%s", err)));
                     unit_metas[unit_count] = corrected;

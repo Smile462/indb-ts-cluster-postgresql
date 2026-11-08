@@ -149,7 +149,9 @@ QueryResult medoid_centers(const std::vector<PageMeta>& units, const std::vector
                            const Config& config) {
   QueryResult result;
   if (units.empty() || candidates.empty()) return result;
-  const PageMeta merged = build_chunk_meta(units, config);
+  Config merge_config = config;
+  merge_config.medoid_page_correction = true;
+  const PageMeta merged = build_chunk_meta(units, merge_config);
   result.stats.represented_subsequences=merged.n_seq;
 
   std::vector<Vec> normalized;
@@ -298,8 +300,26 @@ static PageMeta page_correct_page(const PageMeta& meta, const Points& raw, int64
 PageMeta correct_page(const PageMeta& meta,const Points& raw,int64_t t0,int64_t t1,const Config& config,QueryStats* stats) {
   if(!config.chunk_path)return page_correct_page(meta,raw,t0,t1,config,stats);
   Points restricted;
-  if(stats)stats->raw_points_read+=raw.size();
   for(size_t i=0;i<raw.size();i++)if(raw.ts[i]>=t0 && raw.ts[i]<=t1){restricted.ts.push_back(raw.ts[i]);restricted.values.push_back(raw.values[i]);}
+  if (config.medoid_page_correction && !restricted.ts.empty()) {
+    PageMeta corrected = page_correct_page(meta, raw, t0, t1, config, stats);
+    // Keep the original Page correction mathematics. Only adapt the raw
+    // boundary fragments and time span to the Chunk aggregator's grid layout.
+    corrected.t_start = restricted.ts.front();
+    corrected.t_end = restricted.ts.back();
+    corrected.grid_fragments = true;
+    std::fill(corrected.head_extra.begin(), corrected.head_extra.end(), 0.0);
+    std::fill(corrected.tail_extra.begin(), corrected.tail_extra.end(), 0.0);
+    const int64_t first_complete = ceil_div(corrected.t_start, config.l) * config.l;
+    const int64_t tail_start = floor_div(corrected.t_end + 1, config.l) * config.l;
+    for (size_t i = 0; i < restricted.ts.size(); ++i) {
+      const int position = static_cast<int>((restricted.ts[i] % config.l + config.l) % config.l);
+      if (restricted.ts[i] < first_complete) corrected.head_extra[position] = restricted.values[i];
+      if (restricted.ts[i] >= tail_start) corrected.tail_extra[position] = restricted.values[i];
+    }
+    return corrected;
+  }
+  if(stats)stats->raw_points_read+=raw.size();
   return build_page_meta(restricted,config,config.seed ^ static_cast<uint64_t>(meta.t_start));
 }
 
@@ -310,6 +330,8 @@ QueryResult run_query(const std::vector<ChunkRef>& chunks, const std::vector<Pag
                       const RawPageLoader& loader, bool medoid, const SampledSource& sampler) {
   std::vector<PageMeta> units;
   QueryStats stats;
+  Config page_correction_config = config;
+  page_correction_config.medoid_page_correction = medoid;
 
   auto consider_page = [&](const PageRef& page) {
     ++stats.pages_considered;
@@ -323,7 +345,7 @@ QueryResult run_query(const std::vector<ChunkRef>& chunks, const std::vector<Pag
     if (!loader) throw AlgorithmError("partial page needs a raw loader");
     Points raw;
     if (!loader(page.page_no, &raw)) throw AlgorithmError("cannot load raw page " + std::to_string(page.page_no));
-    units.push_back(correct_page(page.meta, raw, t0, t1, config, &stats));
+    units.push_back(correct_page(page.meta, raw, t0, t1, page_correction_config, &stats));
     ++stats.pages_corrected;
   };
 
