@@ -503,6 +503,12 @@ PageMeta build_chunk_meta(const std::vector<PageMeta>& input_pages, const Config
     // aggregation takes its represented weight from M statistics instead.
     chunk.n_seq = static_cast<int32_t>(chunk.ed_idx.size());
     chunk.idx.assign(static_cast<size_t>(chunk.n_seq), -1);
+  } else if (config.kshape_page_correction) {
+    // This transient query object is consumed only by the K solver. Legacy
+    // Page correction updates K and M independently, so their memberships need
+    // not agree. Preserve K weights instead of enforcing a persisted invariant.
+    chunk.n_seq = static_cast<int32_t>(chunk.idx.size());
+    chunk.ed_idx.assign(static_cast<size_t>(chunk.n_seq), -1);
   } else {
     chunk.n_seq=static_cast<int32_t>(chunk.idx.size());
     if(chunk.ed_idx.size()!=chunk.idx.size())throw AlgorithmError("K/M merged identity counts disagree");

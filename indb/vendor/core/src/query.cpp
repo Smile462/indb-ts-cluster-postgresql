@@ -130,7 +130,9 @@ QueryResult merge_units(const std::vector<PageMeta>& units, const Config& config
 QueryResult kshape_centers(const std::vector<PageMeta>& units, const Config& config) {
   QueryResult result;
   if (units.empty()) return result;
-  const PageMeta merged = build_chunk_meta(units, config);
+  Config merge_config = config;
+  merge_config.kshape_page_correction = config.chunk_path;
+  const PageMeta merged = build_chunk_meta(units, merge_config);
   result.stats.represented_subsequences=merged.n_seq;
   result.centers.resize(static_cast<size_t>(config.k));
   for (int c = 0; c < config.k; ++c) {
@@ -301,8 +303,28 @@ PageMeta correct_page(const PageMeta& meta,const Points& raw,int64_t t0,int64_t 
   if(!config.chunk_path)return page_correct_page(meta,raw,t0,t1,config,stats);
   Points restricted;
   for(size_t i=0;i<raw.size();i++)if(raw.ts[i]>=t0 && raw.ts[i]<=t1){restricted.ts.push_back(raw.ts[i]);restricted.values.push_back(raw.values[i]);}
-  if (config.medoid_page_correction && !restricted.ts.empty()) {
+  const bool usable_k_labels = !meta.is_chunk && meta.k == config.k &&
+      meta.l == config.l && meta.edk == config.edk_effective() && meta.n_seq >= 0 &&
+      meta.idx.size() == static_cast<size_t>(meta.n_seq) &&
+      std::all_of(meta.idx.begin(), meta.idx.end(),
+                  [&](int32_t label) { return label >= 0 && label < meta.k; });
+  if (!restricted.ts.empty() && (config.medoid_page_correction || usable_k_labels)) {
     PageMeta corrected = page_correct_page(meta, raw, t0, t1, config, stats);
+    if (!config.medoid_page_correction) {
+      // Page's matrices/centroids are kept verbatim. Its legacy return value
+      // clears labels; the Chunk-K merger still needs the retained weights.
+      // Retain exactly those stored subsequences not wholly outside Q, which
+      // is the same boundary rule used by the original Page subtraction.
+      corrected.idx.clear();
+      const int64_t first = ceil_div(meta.t_start, config.l) * config.l;
+      for (size_t i = 0; i < meta.idx.size(); ++i) {
+        const int64_t start = first + static_cast<int64_t>(i) * config.l;
+        if (start + config.l - 1 >= t0 && start <= t1)
+          corrected.idx.push_back(meta.idx[i]);
+      }
+      if (corrected.idx.size() != static_cast<size_t>(corrected.n_seq))
+        throw AlgorithmError("Page-K retained membership count disagrees with Page correction");
+    }
     // Keep the original Page correction mathematics. Only adapt the raw
     // boundary fragments and time span to the Chunk aggregator's grid layout.
     corrected.t_start = restricted.ts.front();
